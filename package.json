@@ -7,6 +7,11 @@
     "dev": "NODE_ENV=development tsx watch src/index.ts",
     "build": "tsc",
     "delete:keychain": "bash scripts/delete-google-oauth-keychain.sh",
+    "pm2:delete": "pm2 delete vymo-wishes",
+    "pm2:logs": "pm2 logs vymo-wishes",
+    "pm2:restart": "pm2 restart vymo-wishes",
+    "pm2:start": "pnpm build && pm2 start ecosystem.config.cjs --env production",
+    "pm2:stop": "pm2 stop vymo-wishes",
     "setup:keychain": "bash scripts/setup-google-oauth-keychain.sh",
     "start": "NODE_ENV=production node dist/index.js"
   },
