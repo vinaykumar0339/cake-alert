@@ -1,4 +1,4 @@
-export const APP_NAME = "Cake Alert";
+export const APP_NAME = "Vymo Wishes";
 export const BOT_NAME = "Vymo Wishes";
 
 export const CELEBRATION_JOB_NAME = "celebration";

@@ -1,6 +1,6 @@
 import { google } from "googleapis";
 import { notifyAdmin } from "./admin-alert.service";
-import { getEnv, getRequiredEnv } from "./config";
+import { getRequiredEnv } from "./config";
 import {
   GOOGLE_SHEET_EMPTY_ERROR,
   GOOGLE_SHEET_LOAD_FAILED_LOG,
@@ -13,6 +13,7 @@ import {
   GOOGLE_SHEET_WARNING_TEXT_PREFIX,
 } from "./constants";
 import { type Employee } from "./data/employees";
+import { getGoogleOauthKeychainSecrets } from "./keychain";
 
 let activeEmployeeLoad: Promise<Employee[]> | null = null;
 let lastValidationSignature = "";
@@ -27,22 +28,6 @@ function getGoogleSheetName() {
 
 function getSourceLabel() {
   return `${getGoogleSheetName()} (${getGoogleSheetId()})`;
-}
-
-function hasOauthConfig() {
-  return (
-    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_ID")) &&
-    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_SECRET")) &&
-    Boolean(getEnv("GOOGLE_OAUTH_REFRESH_TOKEN"))
-  );
-}
-
-function hasAnyOauthConfig() {
-  return (
-    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_ID")) ||
-    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_SECRET")) ||
-    Boolean(getEnv("GOOGLE_OAUTH_REFRESH_TOKEN"))
-  );
 }
 
 function normalizeHeader(value: string) {
@@ -262,28 +247,17 @@ function parseSheetRows(rows: string[][]) {
 }
 
 function buildGoogleAuthClient() {
-  if (hasAnyOauthConfig()) {
-    if (!hasOauthConfig()) {
-      throw new Error(
-        "GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, and GOOGLE_OAUTH_REFRESH_TOKEN must all be set together."
-      );
-    }
-
-    const oauthClient = new google.auth.OAuth2(
-      getRequiredEnv("GOOGLE_OAUTH_CLIENT_ID"),
-      getRequiredEnv("GOOGLE_OAUTH_CLIENT_SECRET")
-    );
-
-    oauthClient.setCredentials({
-      refresh_token: getRequiredEnv("GOOGLE_OAUTH_REFRESH_TOKEN"),
-    });
-
-    return oauthClient;
-  }
-
-  throw new Error(
-    "Missing required Google Sheets OAuth variables: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REFRESH_TOKEN."
+  const oauthSecrets = getGoogleOauthKeychainSecrets();
+  const oauthClient = new google.auth.OAuth2(
+    oauthSecrets.clientId,
+    oauthSecrets.clientSecret
   );
+
+  oauthClient.setCredentials({
+    refresh_token: oauthSecrets.refreshToken,
+  });
+
+  return oauthClient;
 }
 
 async function fetchSheetRows(): Promise<string[][]> {

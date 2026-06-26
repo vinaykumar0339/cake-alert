@@ -1,5 +1,5 @@
 import { WebClient } from "@slack/web-api";
-import { getRequiredEnv } from "./config";
+import { getRequiredKeychainValue } from "./keychain";
 
 let slackClient: WebClient | null = null;
 const slackUserIdByEmail = new Map<string, string>();
@@ -9,7 +9,7 @@ export function getSlackClient() {
     return slackClient;
   }
 
-  slackClient = new WebClient(getRequiredEnv("SLACK_BOT_TOKEN"));
+  slackClient = new WebClient(getRequiredKeychainValue("slackBotToken"));
   return slackClient;
 }
 

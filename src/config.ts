@@ -1,5 +1,6 @@
+import { validateRequiredKeychainSecrets } from "./keychain";
+
 const ALWAYS_REQUIRED_ENV_KEYS = [
-  "SLACK_BOT_TOKEN",
   "ADMIN_SLACK_USER_IDS",
   "WISHES_SLACK_TARGET_IDS",
   "GOOGLE_SHEET_ID",
@@ -8,11 +9,7 @@ const ALWAYS_REQUIRED_ENV_KEYS = [
 
 type AlwaysRequiredEnvKey = (typeof ALWAYS_REQUIRED_ENV_KEYS)[number];
 
-type OptionalEnvKey =
-  | "BIRTHDAY_WISH_CRON"
-  | "GOOGLE_OAUTH_CLIENT_ID"
-  | "GOOGLE_OAUTH_CLIENT_SECRET"
-  | "GOOGLE_OAUTH_REFRESH_TOKEN";
+type OptionalEnvKey = "BIRTHDAY_WISH_CRON";
 
 type EnvKey = AlwaysRequiredEnvKey | OptionalEnvKey;
 
@@ -46,25 +43,5 @@ export function validateRequiredEnv() {
     );
   }
 
-  const hasAnyOauthConfig =
-    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_ID")) ||
-    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_SECRET")) ||
-    Boolean(getEnv("GOOGLE_OAUTH_REFRESH_TOKEN"));
-
-  const hasOauthConfig =
-    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_ID")) &&
-    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_SECRET")) &&
-    Boolean(getEnv("GOOGLE_OAUTH_REFRESH_TOKEN"));
-
-  if (hasAnyOauthConfig && !hasOauthConfig) {
-    throw new Error(
-      "GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, and GOOGLE_OAUTH_REFRESH_TOKEN must all be set together."
-    );
-  }
-
-  if (!hasOauthConfig) {
-    throw new Error(
-      "Missing required Google Sheets OAuth variables: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REFRESH_TOKEN."
-    );
-  }
+  validateRequiredKeychainSecrets();
 }
