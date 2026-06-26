@@ -1,33 +1,21 @@
 import { google } from "googleapis";
-import { getEnv, getRequiredEnv, isDevelopmentMode } from "./config";
 import { notifyAdmin } from "./admin-alert.service";
+import { getEnv, getRequiredEnv } from "./config";
 import {
-  getEmployeesFromStore,
-  replaceEmployeesInStore,
-} from "./data/employee.store";
+  GOOGLE_SHEET_EMPTY_ERROR,
+  GOOGLE_SHEET_LOAD_FAILED_LOG,
+  GOOGLE_SHEET_LOAD_FAILED_TEXT_PREFIX,
+  GOOGLE_SHEET_LOAD_FAILED_TITLE,
+  GOOGLE_SHEET_NO_VALID_EMPLOYEES_ERROR,
+  GOOGLE_SHEET_SOURCE_NAME,
+  GOOGLE_SHEET_UNKNOWN_ERROR,
+  GOOGLE_SHEET_VALIDATION_ISSUES_TITLE,
+  GOOGLE_SHEET_WARNING_TEXT_PREFIX,
+} from "./constants";
 import { type Employee } from "./data/employees";
 
-type EmployeeUpdate = {
-  before: Employee;
-  after: Employee;
-};
-
-type EmployeeSyncDiff = {
-  added: Employee[];
-  removed: Employee[];
-  updated: EmployeeUpdate[];
-};
-
-let isSyncInProgress = false;
+let activeEmployeeLoad: Promise<Employee[]> | null = null;
 let lastValidationSignature = "";
-
-function getSheetSyncCronExpressionFromEnv() {
-  if (isDevelopmentMode()) {
-    return "*/2 * * * *";
-  }
-
-  return process.env.SHEET_SYNC_CRON || "*/15 * * * *";
-}
 
 function getGoogleSheetId() {
   return getRequiredEnv("GOOGLE_SHEET_ID");
@@ -37,94 +25,97 @@ function getGoogleSheetName() {
   return getRequiredEnv("GOOGLE_SHEET_NAME");
 }
 
-function getPublicSheetCsvUrl() {
-  return getEnv("GOOGLE_SHEET_PUBLIC_CSV_URL");
-}
-
-function shouldUsePublicCsvSource() {
-  return isDevelopmentMode() && Boolean(getPublicSheetCsvUrl());
-}
-
 function getSourceLabel() {
-  if (shouldUsePublicCsvSource()) {
-    return "Public CSV (dev mode)";
-  }
-
   return `${getGoogleSheetName()} (${getGoogleSheetId()})`;
 }
 
-function getSourceLinkText() {
-  if (!shouldUsePublicCsvSource()) {
-    return null;
-  }
+function hasOauthConfig() {
+  return (
+    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_ID")) &&
+    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_SECRET")) &&
+    Boolean(getEnv("GOOGLE_OAUTH_REFRESH_TOKEN"))
+  );
+}
 
-  const publicCsvUrl = getPublicSheetCsvUrl();
-  if (!publicCsvUrl) {
-    return null;
-  }
-
-  return `<${publicCsvUrl}|Open source CSV>`;
+function hasAnyOauthConfig() {
+  return (
+    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_ID")) ||
+    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_SECRET")) ||
+    Boolean(getEnv("GOOGLE_OAUTH_REFRESH_TOKEN"))
+  );
 }
 
 function normalizeHeader(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function isValidBirthday(value: string) {
-  if (!/^\d{2}-\d{2}$/.test(value)) {
-    return false;
+function isValidEmail(value: string) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function pad(value: number) {
+  return String(value).padStart(2, "0");
+}
+
+function isValidDate(day: number, month: number, year: number) {
+  const date = new Date(Date.UTC(year, month - 1, day));
+
+  return (
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day
+  );
+}
+
+function parseStrictDayMonthYear(value: string) {
+  const normalized = value.trim();
+
+  if (!/^\d{2}-\d{2}-\d{4}$/.test(normalized)) {
+    return null;
   }
 
-  const [monthRaw, dayRaw] = value.split("-");
-  const month = Number(monthRaw);
+  const [dayRaw, monthRaw, yearRaw] = normalized.split("-");
   const day = Number(dayRaw);
+  const month = Number(monthRaw);
+  const year = Number(yearRaw);
 
-  return month >= 1 && month <= 12 && day >= 1 && day <= 31;
-}
-
-function isLikelySlackUserId(value: string) {
-  return /^[UWB][A-Z0-9]+$/.test(value);
-}
-
-function parseCsvLine(line: string): string[] {
-  const values: string[] = [];
-  let current = "";
-  let inQuotes = false;
-
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    const next = line[i + 1];
-
-    if (char === '"') {
-      if (inQuotes && next === '"') {
-        current += '"';
-        i++;
-      } else {
-        inQuotes = !inQuotes;
-      }
-      continue;
-    }
-
-    if (char === "," && !inQuotes) {
-      values.push(current.trim());
-      current = "";
-      continue;
-    }
-
-    current += char;
+  if (!isValidDate(day, month, year)) {
+    return null;
   }
 
-  values.push(current.trim());
-
-  return values;
+  return { day, month, year };
 }
 
-function parseCsvRows(csvText: string): string[][] {
-  return csvText
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .map(parseCsvLine);
+function normalizeBirthday(value: string) {
+  const parsed = parseStrictDayMonthYear(value);
+
+  if (!parsed) {
+    return null;
+  }
+
+  return `${pad(parsed.month)}-${pad(parsed.day)}`;
+}
+
+function normalizeJoiningDate(value: string) {
+  const parsed = parseStrictDayMonthYear(value);
+
+  if (!parsed) {
+    return null;
+  }
+
+  return `${parsed.year}-${pad(parsed.month)}-${pad(parsed.day)}`;
+}
+
+function findHeaderIndex(normalizedHeaders: string[], aliases: string[]) {
+  for (const alias of aliases) {
+    const index = normalizedHeaders.indexOf(alias);
+
+    if (index >= 0) {
+      return index;
+    }
+  }
+
+  return -1;
 }
 
 function parseSheetRows(rows: string[][]) {
@@ -133,21 +124,47 @@ function parseSheetRows(rows: string[][]) {
   if (rows.length === 0) {
     return {
       employees: [],
-      validationErrors: ["Google Sheet is empty."],
+      validationErrors: [GOOGLE_SHEET_EMPTY_ERROR],
     };
   }
 
   const headerRow = rows[0].map((cell) => String(cell).trim());
   const normalizedHeaders = headerRow.map(normalizeHeader);
 
-  const requiredHeaders = ["name", "slackuserid", "birthday"] as const;
-  const missingHeaders = requiredHeaders.filter(
-    (header) => !normalizedHeaders.includes(header)
-  );
+  const employeeIdIndex = findHeaderIndex(normalizedHeaders, [
+    "employeeid",
+    "empid",
+  ]);
+  const nameIndex = findHeaderIndex(normalizedHeaders, ["fullname", "name"]);
+  const emailIndex = findHeaderIndex(normalizedHeaders, ["email", "workemail"]);
+  const birthdayIndex = findHeaderIndex(normalizedHeaders, ["birthday", "dob"]);
+  const joiningDateIndex = findHeaderIndex(normalizedHeaders, [
+    "joiningdate",
+    "dateofjoining",
+    "doj",
+  ]);
+
+  const missingHeaders: string[] = [];
+
+  if (nameIndex < 0) {
+    missingHeaders.push("Full Name");
+  }
+
+  if (emailIndex < 0) {
+    missingHeaders.push("Email");
+  }
+
+  if (birthdayIndex < 0) {
+    missingHeaders.push("Birthday");
+  }
+
+  if (joiningDateIndex < 0) {
+    missingHeaders.push("Joining date");
+  }
 
   if (missingHeaders.length > 0) {
     validationErrors.push(
-      `Missing required header(s): ${missingHeaders.join(", ")}. Expected header row to include name, slackUserId, birthday.`
+      `Missing required header(s): ${missingHeaders.join(", ")}.`
     );
 
     return {
@@ -156,72 +173,86 @@ function parseSheetRows(rows: string[][]) {
     };
   }
 
-  const nameIndex = normalizedHeaders.indexOf("name");
-  const slackUserIdIndex = normalizedHeaders.indexOf("slackuserid");
-  const birthdayIndex = normalizedHeaders.indexOf("birthday");
-
   const employees: Employee[] = [];
-  const seenSlackUserIds = new Set<string>();
+  const seenEmails = new Set<string>();
 
   for (let index = 1; index < rows.length; index++) {
     const row = rows[index].map((cell) => String(cell).trim());
     const rowNumber = index + 1;
-
+    const employeeId =
+      employeeIdIndex >= 0 ? row[employeeIdIndex] || `row-${rowNumber}` : `row-${rowNumber}`;
     const name = row[nameIndex] || "";
-    const slackUserId = row[slackUserIdIndex] || "";
-    const birthday = row[birthdayIndex] || "";
+    const rawEmail = row[emailIndex] || "";
+    const email = rawEmail.toLowerCase();
+    const rawBirthday = row[birthdayIndex] || "";
+    const rawJoiningDate = row[joiningDateIndex] || "";
 
-    if (!name && !slackUserId && !birthday) {
+    if (!name && !email && !rawBirthday && !rawJoiningDate) {
       continue;
     }
 
     if (!name) {
-      validationErrors.push(`Row ${rowNumber}: name is missing.`);
+      validationErrors.push(`Row ${rowNumber}: full name is missing.`);
       continue;
     }
 
-    if (!slackUserId) {
-      validationErrors.push(`Row ${rowNumber}: slackUserId is missing.`);
+    if (!email) {
+      validationErrors.push(`Row ${rowNumber}: email is missing.`);
       continue;
     }
 
-    if (!isLikelySlackUserId(slackUserId)) {
+    if (!isValidEmail(email)) {
+      validationErrors.push(`Row ${rowNumber}: email "${rawEmail}" is invalid.`);
+      continue;
+    }
+
+    if (seenEmails.has(email)) {
       validationErrors.push(
-        `Row ${rowNumber}: slackUserId "${slackUserId}" looks invalid. Use a member ID like U012AB3CD.`
+        `Row ${rowNumber}: duplicate email "${rawEmail}" found.`
       );
       continue;
     }
 
-    if (seenSlackUserIds.has(slackUserId)) {
-      validationErrors.push(
-        `Row ${rowNumber}: duplicate slackUserId "${slackUserId}" found. Each employee must be unique.`
-      );
-      continue;
-    }
-
-    if (!birthday) {
+    if (!rawBirthday) {
       validationErrors.push(`Row ${rowNumber}: birthday is missing.`);
       continue;
     }
 
-    if (!isValidBirthday(birthday)) {
+    const birthday = normalizeBirthday(rawBirthday);
+
+    if (!birthday) {
       validationErrors.push(
-        `Row ${rowNumber}: birthday "${birthday}" is invalid. Use MM-DD format, e.g. 08-20.`
+        `Row ${rowNumber}: birthday "${rawBirthday}" is invalid. Use DD-MM-YYYY format.`
       );
       continue;
     }
 
-    seenSlackUserIds.add(slackUserId);
-    employees.push({ name, slackUserId, birthday });
+    if (!rawJoiningDate) {
+      validationErrors.push(`Row ${rowNumber}: joining date is missing.`);
+      continue;
+    }
+
+    const joiningDate = normalizeJoiningDate(rawJoiningDate);
+
+    if (!joiningDate) {
+      validationErrors.push(
+        `Row ${rowNumber}: joining date "${rawJoiningDate}" is invalid. Use DD-MM-YYYY format.`
+      );
+      continue;
+    }
+
+    seenEmails.add(email);
+    employees.push({
+      employeeId,
+      name,
+      email,
+      birthday,
+      joiningDate,
+    });
   }
 
   if (employees.length === 0) {
-    validationErrors.push("No valid rows were found in Google Sheet.");
-
-    return {
-      employees: [],
-      validationErrors,
-    };
+    validationErrors.push(`No valid rows were found in ${GOOGLE_SHEET_SOURCE_NAME}.`);
   }
 
   return {
@@ -230,205 +261,40 @@ function parseSheetRows(rows: string[][]) {
   };
 }
 
-async function fetchSheetRowsFromPublicCsv(): Promise<string[][]> {
-  const publicCsvUrl = getPublicSheetCsvUrl();
+function buildGoogleAuthClient() {
+  if (hasAnyOauthConfig()) {
+    if (!hasOauthConfig()) {
+      throw new Error(
+        "GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, and GOOGLE_OAUTH_REFRESH_TOKEN must all be set together."
+      );
+    }
 
-  if (!publicCsvUrl) {
-    throw new Error("GOOGLE_SHEET_PUBLIC_CSV_URL is not configured");
+    const oauthClient = new google.auth.OAuth2(
+      getRequiredEnv("GOOGLE_OAUTH_CLIENT_ID"),
+      getRequiredEnv("GOOGLE_OAUTH_CLIENT_SECRET")
+    );
+
+    oauthClient.setCredentials({
+      refresh_token: getRequiredEnv("GOOGLE_OAUTH_REFRESH_TOKEN"),
+    });
+
+    return oauthClient;
   }
 
-  const response = await fetch(publicCsvUrl);
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch public CSV: HTTP ${response.status}`);
-  }
-
-  const csvText = await response.text();
-  return parseCsvRows(csvText);
+  throw new Error(
+    "Missing required Google Sheets OAuth variables: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REFRESH_TOKEN."
+  );
 }
 
-async function fetchSheetRowsFromGoogleApi(): Promise<string[][]> {
-  const auth = new google.auth.GoogleAuth({
-    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
-  });
-
+async function fetchSheetRows(): Promise<string[][]> {
+  const auth = buildGoogleAuthClient();
   const sheets = google.sheets({ version: "v4", auth });
-
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId: getGoogleSheetId(),
     range: getGoogleSheetName(),
   });
 
   return (response.data.values as string[][] | undefined) ?? [];
-}
-
-async function fetchSheetRows(): Promise<string[][]> {
-  if (shouldUsePublicCsvSource()) {
-    return fetchSheetRowsFromPublicCsv();
-  }
-
-  return fetchSheetRowsFromGoogleApi();
-}
-
-function toEmployeeMap(employees: Employee[]) {
-  return new Map(employees.map((employee) => [employee.slackUserId, employee]));
-}
-
-function diffEmployees(previous: Employee[], next: Employee[]): EmployeeSyncDiff {
-  const previousMap = toEmployeeMap(previous);
-  const nextMap = toEmployeeMap(next);
-
-  const added: Employee[] = [];
-  const removed: Employee[] = [];
-  const updated: EmployeeUpdate[] = [];
-
-  for (const [slackUserId, nextEmployee] of nextMap.entries()) {
-    const previousEmployee = previousMap.get(slackUserId);
-
-    if (!previousEmployee) {
-      added.push(nextEmployee);
-      continue;
-    }
-
-    if (
-      previousEmployee.name !== nextEmployee.name ||
-      previousEmployee.birthday !== nextEmployee.birthday
-    ) {
-      updated.push({ before: previousEmployee, after: nextEmployee });
-    }
-  }
-
-  for (const [slackUserId, previousEmployee] of previousMap.entries()) {
-    if (!nextMap.has(slackUserId)) {
-      removed.push(previousEmployee);
-    }
-  }
-
-  return { added, removed, updated };
-}
-
-function formatEmployee(employee: Employee) {
-  return `${employee.name} (<@${employee.slackUserId}>, ${employee.birthday})`;
-}
-
-function buildListSection(title: string, lines: string[]) {
-  if (lines.length === 0) {
-    return null;
-  }
-
-  return {
-    type: "section",
-    text: {
-      type: "mrkdwn",
-      text: `*${title}*\n${lines.join("\n")}`,
-    },
-  };
-}
-
-function buildSyncSummaryBlocks(args: {
-  trigger: string;
-  total: number;
-  diff: EmployeeSyncDiff;
-}) {
-  const { trigger, total, diff } = args;
-  const addedLines = diff.added.slice(0, 8).map((employee) => `• ${formatEmployee(employee)}`);
-  const removedLines = diff.removed
-    .slice(0, 8)
-    .map((employee) => `• ${formatEmployee(employee)}`);
-  const updatedLines = diff.updated.slice(0, 8).map((change) => {
-    const before = `${change.before.name}/${change.before.birthday}`;
-    const after = `${change.after.name}/${change.after.birthday}`;
-    return `• <@${change.after.slackUserId}>: ${before} -> ${after}`;
-  });
-
-  const blocks: Array<Record<string, unknown>> = [
-    { type: "divider" },
-    {
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `*:satellite: Cake Alert Sheet Sync* • \`${trigger}\``,
-      },
-    },
-    {
-      type: "section",
-      fields: [
-        { type: "mrkdwn", text: `*Source*\n${getSourceLabel()}` },
-        { type: "mrkdwn", text: `*Employees*\n${total}` },
-        { type: "mrkdwn", text: `*Added*\n${diff.added.length}` },
-        { type: "mrkdwn", text: `*Removed*\n${diff.removed.length}` },
-        { type: "mrkdwn", text: `*Updated*\n${diff.updated.length}` },
-      ],
-    },
-  ];
-
-  const sourceLinkText = getSourceLinkText();
-  if (sourceLinkText) {
-    blocks.push({
-      type: "context",
-      elements: [{ type: "mrkdwn", text: sourceLinkText }],
-    });
-  }
-
-  const addedBlock = buildListSection("Added Entries", addedLines);
-  if (addedBlock) {
-    blocks.push(addedBlock);
-  }
-
-  const removedBlock = buildListSection("Removed Entries", removedLines);
-  if (removedBlock) {
-    blocks.push(removedBlock);
-  }
-
-  const updatedBlock = buildListSection("Updated Entries", updatedLines);
-  if (updatedBlock) {
-    blocks.push(updatedBlock);
-  }
-
-  if (
-    diff.added.length === 0 &&
-    diff.removed.length === 0 &&
-    diff.updated.length === 0
-  ) {
-    blocks.push({
-      type: "context",
-      elements: [
-        {
-          type: "mrkdwn",
-          text: "No employee changes detected in this sync.",
-        },
-      ],
-    });
-  }
-
-  blocks.push(
-    {
-      type: "context",
-      elements: [
-        {
-          type: "mrkdwn",
-          text: `Synced at ${new Date().toISOString()}`,
-        },
-      ],
-    },
-    { type: "divider" }
-  );
-
-  return blocks;
-}
-
-function buildSyncSummaryText(args: {
-  trigger: string;
-  total: number;
-  diff: EmployeeSyncDiff;
-}) {
-  const { trigger, total, diff } = args;
-  return [
-    `Cake Alert sheet sync completed [${trigger}]`,
-    `Source: ${getSourceLabel()}`,
-    `Employees: ${total}`,
-    `Added: ${diff.added.length}, Removed: ${diff.removed.length}, Updated: ${diff.updated.length}`,
-  ].join(" | ");
 }
 
 function buildValidationWarningBlocks(errors: string[]) {
@@ -441,7 +307,7 @@ function buildValidationWarningBlocks(errors: string[]) {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*:warning: Cake Alert Sheet Validation Issues*",
+        text: GOOGLE_SHEET_VALIDATION_ISSUES_TITLE,
       },
     },
     {
@@ -484,14 +350,12 @@ function buildFailureBlocks(errorMessage: string) {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*:x: Cake Alert Sheet Sync Failed*",
+        text: GOOGLE_SHEET_LOAD_FAILED_TITLE,
       },
     },
     {
       type: "section",
-      fields: [
-        { type: "mrkdwn", text: `*Source*\n${getSourceLabel()}` },
-      ],
+      fields: [{ type: "mrkdwn", text: `*Source*\n${getSourceLabel()}` }],
     },
     {
       type: "section",
@@ -519,56 +383,50 @@ async function notifyValidationErrorsIfChanged(errors: string[]) {
   lastValidationSignature = signature;
 
   await notifyAdmin({
-    text: `Cake Alert sheet sync warning: ${errors.length} issue(s).`,
+    text: `${GOOGLE_SHEET_WARNING_TEXT_PREFIX} ${errors.length} issue(s).`,
     blocks: buildValidationWarningBlocks(errors),
     unfurlLinks: false,
   });
 }
 
-export function getSheetSyncCronExpression() {
-  return getSheetSyncCronExpressionFromEnv();
-}
+async function loadEmployees(trigger: string) {
+  const rows = await fetchSheetRows();
+  const { employees, validationErrors } = parseSheetRows(rows);
 
-export async function syncEmployeesFromGoogleSheet(trigger: string) {
-  if (isSyncInProgress) {
-    console.log("Skipping sheet sync because previous sync is still in progress.");
-    return;
+  await notifyValidationErrorsIfChanged(validationErrors);
+
+  if (employees.length === 0) {
+    throw new Error(GOOGLE_SHEET_NO_VALID_EMPLOYEES_ERROR);
   }
 
-  isSyncInProgress = true;
+  console.log(
+    `Loaded ${employees.length} employee(s) from ${GOOGLE_SHEET_SOURCE_NAME} [trigger=${trigger}]`
+  );
+
+  return employees;
+}
+
+export async function loadEmployeesFromGoogleSheet(trigger: string) {
+  if (!activeEmployeeLoad) {
+    activeEmployeeLoad = loadEmployees(trigger).finally(() => {
+      activeEmployeeLoad = null;
+    });
+  }
 
   try {
-    const previousEmployees = getEmployeesFromStore();
-    const rows = await fetchSheetRows();
-    const { employees, validationErrors } = parseSheetRows(rows);
-    const diff = diffEmployees(previousEmployees, employees);
-
-    replaceEmployeesInStore(employees);
-
-    console.log(
-      `Synced ${employees.length} employee(s) from Google Sheet [trigger=${trigger}]`
-    );
-
-    await notifyValidationErrorsIfChanged(validationErrors);
-
-    await notifyAdmin({
-      text: buildSyncSummaryText({ trigger, total: employees.length, diff }),
-      blocks: buildSyncSummaryBlocks({
-        trigger,
-        total: employees.length,
-        diff,
-      }),
-      unfurlLinks: false,
-    });
+    return await activeEmployeeLoad;
   } catch (error) {
-    console.error("Google Sheet sync failed. Keeping existing in-memory data.", error);
+    const message =
+      error instanceof Error ? error.message : GOOGLE_SHEET_UNKNOWN_ERROR;
+
+    console.error(GOOGLE_SHEET_LOAD_FAILED_LOG, error);
 
     await notifyAdmin({
-      text: `Cake Alert sheet sync failed: ${(error as Error).message}`,
-      blocks: buildFailureBlocks((error as Error).message),
+      text: `${GOOGLE_SHEET_LOAD_FAILED_TEXT_PREFIX} ${message}`,
+      blocks: buildFailureBlocks(message),
       unfurlLinks: false,
     });
-  } finally {
-    isSyncInProgress = false;
+
+    throw error;
   }
 }

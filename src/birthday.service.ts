@@ -1,16 +1,34 @@
 import { notifyAdmin } from "./admin-alert.service";
-import { isDevelopmentMode } from "./config";
-import { getEmployeesFromStore } from "./data/employee.store";
-import { getSlackClient } from "./slack";
+import { getRequiredEnv, isDevelopmentMode } from "./config";
+import {
+  CELEBRATION_DELIVERY_ISSUES_TITLE,
+  CELEBRATION_TYPES,
+  GOOGLE_SHEET_BIRTHDAY_CRON_TRIGGER,
+  SLACK_USER_NOT_FOUND_REASON,
+} from "./constants";
+import { loadEmployeesFromGoogleSheet } from "./google-sheet.service";
+import { getSlackClient, lookupSlackUserIdByEmail } from "./slack";
 
-const sentBirthdayKeys = new Set<string>();
-let currentBirthdayDateKey = "";
+const sentCelebrationKeys = new Set<string>();
+let currentCelebrationDateKey = "";
 
-type BirthdaySendFailure = {
+type CelebrationType =
+  (typeof CELEBRATION_TYPES)[keyof typeof CELEBRATION_TYPES];
+
+type CelebrationSendFailure = {
   name: string;
-  slackUserId: string;
+  email: string;
+  celebrationType: CelebrationType;
+  targetId: string;
   reason: string;
 };
+
+function getWishesSlackTargetIds() {
+  return getRequiredEnv("WISHES_SLACK_TARGET_IDS")
+    .split(",")
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0);
+}
 
 function getTodayMMDD() {
   const today = new Date();
@@ -30,6 +48,16 @@ function getTodayDateKey() {
   return `${year}-${month}-${day}`;
 }
 
+function getMonthDayFromIsoDate(value: string) {
+  return value.slice(5, 10);
+}
+
+function getWorkAnniversaryYears(joiningDate: string, todayDateKey: string) {
+  const joiningYear = Number(joiningDate.slice(0, 4));
+  const currentYear = Number(todayDateKey.slice(0, 4));
+  return currentYear - joiningYear;
+}
+
 function extractSlackErrorReason(error: unknown) {
   if (typeof error === "object" && error !== null) {
     const maybe = error as { data?: { error?: string }; message?: string };
@@ -46,7 +74,7 @@ function extractSlackErrorReason(error: unknown) {
   return String(error);
 }
 
-function buildBirthdayMessage(name: string, slackUserId: string) {
+function buildBirthdayMessage(name: string, celebrantReference: string) {
   return {
     text: `🎂 Happy Birthday, ${name}!`,
     blocks: [
@@ -57,40 +85,87 @@ function buildBirthdayMessage(name: string, slackUserId: string) {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `*:birthday: Happy Birthday <@${slackUserId}>!*`,
+          text: `It’s ${celebrantReference}’s Birthday!!! :tada:`,
         },
       },
       {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: "Wishing you a fantastic year ahead filled with joy, growth, and lots of cake! :tada:",
+          text: "Let’s take a moment to wish them all the happiness, success, and a wonderful year ahead.",
         },
       },
       {
-        type: "context",
-        elements: [
-          {
-            type: "mrkdwn",
-            text: "Enjoy your special day! :cake:",
-          },
-        ],
+        type: "divider",
       },
       {
-        type: "divider",
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: "Here’s to a wonderful year ahead and, of course, lots of cake :birthday: :cake:",
+        },
       },
     ],
   };
 }
 
-async function notifyBirthdaySendFailures(failures: BirthdaySendFailure[]) {
+function buildWorkAnniversaryMessage(
+  name: string,
+  celebrantReference: string,
+  years: number
+) {
+  return {
+    text: `🎉 Happy Work Anniversary, ${name}!`,
+    blocks: [
+      {
+        type: "divider",
+      },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `Happy Work Anniversary, ${celebrantReference}! :confetti_ball:`,
+        },
+      },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `Congratulations on completing ${years} amazing year${years === 1 ? "" : "s"} with us!`,
+        },
+      },
+      {
+        type: "divider",
+      },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: "Your hard work, dedication, and contributions are truly appreciated.",
+        },
+      },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: "Wishing you continued success and many more milestones ahead! :rocket:",
+        },
+      },
+    ],
+  };
+}
+
+async function notifyCelebrationSendFailures(failures: CelebrationSendFailure[]) {
   if (failures.length === 0) {
     return;
   }
 
   const lines = failures
     .slice(0, 10)
-    .map((failure) => `• ${failure.name} (<@${failure.slackUserId}>): ${failure.reason}`);
+    .map(
+      (failure) =>
+        `• ${failure.name} (${failure.email}, ${failure.celebrationType}, target=${failure.targetId}): ${failure.reason}`
+    );
   const remaining = failures.length - lines.length;
 
   const blocks: Array<Record<string, unknown>> = [
@@ -99,7 +174,7 @@ async function notifyBirthdaySendFailures(failures: BirthdaySendFailure[]) {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: "*:warning: Birthday Message Delivery Issues*",
+        text: CELEBRATION_DELIVERY_ISSUES_TITLE,
       },
     },
     {
@@ -127,12 +202,12 @@ async function notifyBirthdaySendFailures(failures: BirthdaySendFailure[]) {
 
   try {
     await notifyAdmin({
-      text: `Birthday delivery failed for ${failures.length} user(s).`,
+      text: `Celebration delivery failed for ${failures.length} message(s).`,
       blocks,
       unfurlLinks: false,
     });
   } catch (error) {
-    console.error("Failed to notify admins about birthday send failures.", error);
+    console.error("Failed to notify admins about celebration send failures.", error);
   }
 }
 
@@ -140,55 +215,148 @@ export async function sendBirthdayWishes() {
   const today = getTodayMMDD();
   const todayDateKey = getTodayDateKey();
   const isDev = isDevelopmentMode();
+  const wishesSlackTargetIds = getWishesSlackTargetIds();
 
-  if (!isDev && currentBirthdayDateKey !== todayDateKey) {
-    currentBirthdayDateKey = todayDateKey;
-    sentBirthdayKeys.clear();
+  if (!isDev && currentCelebrationDateKey !== todayDateKey) {
+    currentCelebrationDateKey = todayDateKey;
+    sentCelebrationKeys.clear();
   }
 
-  const employees = getEmployeesFromStore();
-  const sendFailures: BirthdaySendFailure[] = [];
+  const employees = await loadEmployeesFromGoogleSheet(
+    GOOGLE_SHEET_BIRTHDAY_CRON_TRIGGER
+  );
+  const sendFailures: CelebrationSendFailure[] = [];
+  const birthdayCelebrants = employees.filter((employee) => employee.birthday === today);
+  const workAnniversaryCelebrants = employees.filter(
+    (employee) => getMonthDayFromIsoDate(employee.joiningDate) === today
+  );
 
   console.log("Today:", today);
+  console.log(
+    `Matched ${birthdayCelebrants.length} birthday(s) and ${workAnniversaryCelebrants.length} work anniversary(ies) for ${today}.`
+  );
+
+  if (birthdayCelebrants.length === 0 && workAnniversaryCelebrants.length === 0) {
+    console.log("No celebrations found for today.");
+  }
 
   for (const employee of employees) {
-    if (employee.birthday !== today) {
+    const shouldCelebrateBirthday = employee.birthday === today;
+    const shouldCelebrateWorkAnniversary =
+      getMonthDayFromIsoDate(employee.joiningDate) === today;
+
+    if (!shouldCelebrateBirthday && !shouldCelebrateWorkAnniversary) {
       continue;
     }
 
-    const sentKey = `${todayDateKey}:${employee.slackUserId}`;
-
-    if (!isDev && sentBirthdayKeys.has(sentKey)) {
-      continue;
-    }
-
-    const message = buildBirthdayMessage(employee.name, employee.slackUserId);
+    let slackUserId: string | null = null;
 
     try {
-      await getSlackClient().chat.postMessage({
-        channel: employee.slackUserId,
-        ...message,
-        unfurl_links: false,
-      });
-
-      if (!isDev) {
-        sentBirthdayKeys.add(sentKey);
-      }
-      console.log(`Sent birthday wish to ${employee.name}`);
+      slackUserId = await lookupSlackUserIdByEmail(employee.email);
     } catch (error) {
       const reason = extractSlackErrorReason(error);
 
       console.error(
-        `Failed to send birthday wish to ${employee.name} (${employee.slackUserId}): ${reason}`
+        `Failed to resolve Slack user for ${employee.name} (${employee.email}): ${reason}`
       );
+    }
 
-      sendFailures.push({
-        name: employee.name,
-        slackUserId: employee.slackUserId,
-        reason,
-      });
+    if (!slackUserId) {
+      console.warn(
+        `Falling back to employee name for wishes because Slack user lookup failed for ${employee.name} (${employee.email}). ${SLACK_USER_NOT_FOUND_REASON}`
+      );
+    }
+
+    const celebrantReference = slackUserId ? `<@${slackUserId}>` : employee.name;
+
+    if (shouldCelebrateBirthday) {
+      for (const targetId of wishesSlackTargetIds) {
+        const sentKey = `${todayDateKey}:${CELEBRATION_TYPES.birthday}:${employee.email.toLowerCase()}:${targetId}`;
+
+        if (isDev || !sentCelebrationKeys.has(sentKey)) {
+          const message = buildBirthdayMessage(employee.name, celebrantReference);
+
+          try {
+            await getSlackClient().chat.postMessage({
+              channel: targetId,
+              ...message,
+              unfurl_links: false,
+            });
+
+            if (!isDev) {
+              sentCelebrationKeys.add(sentKey);
+            }
+
+            console.log(`Sent birthday wish to ${employee.name} in ${targetId}`);
+          } catch (error) {
+            const reason = extractSlackErrorReason(error);
+
+            console.error(
+              `Failed to send birthday wish to ${employee.name} (${employee.email}) in ${targetId}: ${reason}`
+            );
+
+            sendFailures.push({
+              name: employee.name,
+              email: employee.email,
+              celebrationType: CELEBRATION_TYPES.birthday,
+              targetId,
+              reason,
+            });
+          }
+        }
+      }
+    }
+
+    if (shouldCelebrateWorkAnniversary) {
+      const years = getWorkAnniversaryYears(employee.joiningDate, todayDateKey);
+
+      if (years <= 0) {
+        continue;
+      }
+
+      for (const targetId of wishesSlackTargetIds) {
+        const sentKey = `${todayDateKey}:${CELEBRATION_TYPES.workAnniversary}:${employee.email.toLowerCase()}:${targetId}`;
+
+        if (isDev || !sentCelebrationKeys.has(sentKey)) {
+          const message = buildWorkAnniversaryMessage(
+            employee.name,
+            celebrantReference,
+            years
+          );
+
+          try {
+            await getSlackClient().chat.postMessage({
+              channel: targetId,
+              ...message,
+              unfurl_links: false,
+            });
+
+            if (!isDev) {
+              sentCelebrationKeys.add(sentKey);
+            }
+
+            console.log(
+              `Sent work anniversary wish to ${employee.name} for ${years} year(s) in ${targetId}`
+            );
+          } catch (error) {
+            const reason = extractSlackErrorReason(error);
+
+            console.error(
+              `Failed to send work anniversary wish to ${employee.name} (${employee.email}) in ${targetId}: ${reason}`
+            );
+
+            sendFailures.push({
+              name: employee.name,
+              email: employee.email,
+              celebrationType: CELEBRATION_TYPES.workAnniversary,
+              targetId,
+              reason,
+            });
+          }
+        }
+      }
     }
   }
 
-  await notifyBirthdaySendFailures(sendFailures);
+  await notifyCelebrationSendFailures(sendFailures);
 }

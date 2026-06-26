@@ -1,4 +1,9 @@
 import { getRequiredEnv } from "./config";
+import {
+  BOT_ONLINE_TEXT,
+  BOT_ONLINE_TITLE,
+  CELEBRATION_MONITORING_TEXT,
+} from "./constants";
 import { getSlackClient } from "./slack";
 
 type AdminMessage = {
@@ -8,7 +13,7 @@ type AdminMessage = {
 };
 
 type AdminDeliveryFailure = {
-  adminId: string;
+  recipientId: string;
   reason: string;
 };
 
@@ -35,21 +40,24 @@ function extractSlackErrorReason(error: unknown) {
   return String(error);
 }
 
-async function sendToAdmins(message: AdminMessage) {
+async function sendToRecipients(
+  message: AdminMessage,
+  recipientIds: string[],
+  recipientLabel: string
+) {
   const slackClient = getSlackClient();
-  const adminIds = getAdminSlackUserIds();
 
   const responses = await Promise.allSettled(
-    adminIds.map((adminId) => {
+    recipientIds.map((recipientId) => {
       const payload = message.blocks
         ? {
-            channel: adminId,
+            channel: recipientId,
             text: message.text,
             blocks: message.blocks,
             unfurl_links: message.unfurlLinks ?? false,
           }
         : {
-            channel: adminId,
+            channel: recipientId,
             text: message.text,
             unfurl_links: message.unfurlLinks ?? false,
           };
@@ -68,23 +76,23 @@ async function sendToAdmins(message: AdminMessage) {
     }
 
     failures.push({
-      adminId: adminIds[index],
+      recipientId: recipientIds[index],
       reason: extractSlackErrorReason(result.reason),
     });
   });
 
   if (failures.length > 0) {
     console.warn(
-      `Admin notification failed for ${failures.length} admin(s): ${failures
-        .map((failure) => `${failure.adminId}(${failure.reason})`)
+      `${recipientLabel} notification failed for ${failures.length} recipient(s): ${failures
+        .map((failure) => `${failure.recipientId}(${failure.reason})`)
         .join(", ")}`
     );
   }
 
   if (successCount === 0) {
     throw new Error(
-      `Failed to send admin notification to all admins: ${failures
-        .map((failure) => `${failure.adminId}(${failure.reason})`)
+      `Failed to send ${recipientLabel.toLowerCase()} notification to all recipients: ${failures
+        .map((failure) => `${failure.recipientId}(${failure.reason})`)
         .join(", ")}`
     );
   }
@@ -92,16 +100,16 @@ async function sendToAdmins(message: AdminMessage) {
 
 export async function notifyAdmin(message: string | AdminMessage) {
   if (typeof message === "string") {
-    await sendToAdmins({ text: message });
+    await sendToRecipients({ text: message }, getAdminSlackUserIds(), "Admin");
     return;
   }
 
-  await sendToAdmins(message);
+  await sendToRecipients(message, getAdminSlackUserIds(), "Admin");
 }
 
 export async function notifyBotOnline() {
-  await sendToAdmins({
-    text: "Cake Alert bot is online.",
+  await notifyAdmin({
+    text: BOT_ONLINE_TEXT,
     blocks: [
       {
         type: "divider",
@@ -110,7 +118,7 @@ export async function notifyBotOnline() {
         type: "header",
         text: {
           type: "plain_text",
-          text: "Cake Alert Bot Online",
+          text: BOT_ONLINE_TITLE,
           emoji: true,
         },
       },
@@ -118,7 +126,7 @@ export async function notifyBotOnline() {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: ":white_check_mark: Bot started successfully and is now monitoring birthdays.",
+          text: CELEBRATION_MONITORING_TEXT,
         },
       },
       {

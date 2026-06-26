@@ -1,14 +1,18 @@
 const ALWAYS_REQUIRED_ENV_KEYS = [
   "SLACK_BOT_TOKEN",
   "ADMIN_SLACK_USER_IDS",
+  "WISHES_SLACK_TARGET_IDS",
+  "GOOGLE_SHEET_ID",
+  "GOOGLE_SHEET_NAME",
 ] as const;
 
 type AlwaysRequiredEnvKey = (typeof ALWAYS_REQUIRED_ENV_KEYS)[number];
 
 type OptionalEnvKey =
-  | "GOOGLE_SHEET_ID"
-  | "GOOGLE_SHEET_NAME"
-  | "GOOGLE_SHEET_PUBLIC_CSV_URL";
+  | "BIRTHDAY_WISH_CRON"
+  | "GOOGLE_OAUTH_CLIENT_ID"
+  | "GOOGLE_OAUTH_CLIENT_SECRET"
+  | "GOOGLE_OAUTH_REFRESH_TOKEN";
 
 type EnvKey = AlwaysRequiredEnvKey | OptionalEnvKey;
 
@@ -31,30 +35,36 @@ export function isDevelopmentMode() {
 }
 
 export function validateRequiredEnv() {
-  const missingAlwaysRequired = ALWAYS_REQUIRED_ENV_KEYS.filter((key) => {
+  const missingRequired = ALWAYS_REQUIRED_ENV_KEYS.filter((key) => {
     const value = getEnv(key);
     return !value;
   });
 
-  if (missingAlwaysRequired.length > 0) {
+  if (missingRequired.length > 0) {
     throw new Error(
-      `Missing required environment variables: ${missingAlwaysRequired.join(", ")}`
+      `Missing required environment variables: ${missingRequired.join(", ")}`
     );
   }
 
-  const publicCsvUrl = getEnv("GOOGLE_SHEET_PUBLIC_CSV_URL");
+  const hasAnyOauthConfig =
+    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_ID")) ||
+    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_SECRET")) ||
+    Boolean(getEnv("GOOGLE_OAUTH_REFRESH_TOKEN"));
 
-  if (isDevelopmentMode() && publicCsvUrl) {
-    return;
+  const hasOauthConfig =
+    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_ID")) &&
+    Boolean(getEnv("GOOGLE_OAUTH_CLIENT_SECRET")) &&
+    Boolean(getEnv("GOOGLE_OAUTH_REFRESH_TOKEN"));
+
+  if (hasAnyOauthConfig && !hasOauthConfig) {
+    throw new Error(
+      "GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, and GOOGLE_OAUTH_REFRESH_TOKEN must all be set together."
+    );
   }
 
-  const missingSheetConfig = ["GOOGLE_SHEET_ID", "GOOGLE_SHEET_NAME"].filter(
-    (key) => !getEnv(key as OptionalEnvKey)
-  );
-
-  if (missingSheetConfig.length > 0) {
+  if (!hasOauthConfig) {
     throw new Error(
-      `Missing required environment variables: ${missingSheetConfig.join(", ")}`
+      "Missing required Google Sheets OAuth variables: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REFRESH_TOKEN."
     );
   }
 }
