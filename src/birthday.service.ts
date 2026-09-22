@@ -74,7 +74,11 @@ function extractSlackErrorReason(error: unknown) {
   return String(error);
 }
 
-function buildBirthdayMessage(name: string, celebrantReference: string) {
+function buildBirthdayMessage(
+  name: string,
+  celebrantReference: string,
+  managerName?: string
+) {
   return {
     text: `🎂 Happy Birthday, ${name}!`,
     blocks: [
@@ -105,6 +109,17 @@ function buildBirthdayMessage(name: string, celebrantReference: string) {
           text: "Here’s to a wonderful year ahead and, of course, lots of cake :birthday: :cake:",
         },
       },
+      ...(managerName
+        ? [
+            {
+              type: "section",
+              text: {
+                type: "mrkdwn",
+                text: `CC: ${managerName}`,
+              },
+            },
+          ]
+        : []),
     ],
   };
 }
@@ -112,7 +127,8 @@ function buildBirthdayMessage(name: string, celebrantReference: string) {
 function buildWorkAnniversaryMessage(
   name: string,
   celebrantReference: string,
-  years: number
+  years: number,
+  managerName?: string
 ) {
   return {
     text: `🎉 Happy Work Anniversary, ${name}!`,
@@ -151,6 +167,17 @@ function buildWorkAnniversaryMessage(
           text: "Wishing you continued success and many more milestones ahead! :rocket:",
         },
       },
+      ...(managerName
+        ? [
+            {
+              type: "section",
+              text: {
+                type: "mrkdwn",
+                text: `CC: ${managerName}`,
+              },
+            },
+          ]
+        : []),
     ],
   };
 }
@@ -274,7 +301,11 @@ export async function sendBirthdayWishes() {
         const sentKey = `${todayDateKey}:${CELEBRATION_TYPES.birthday}:${employee.email.toLowerCase()}:${targetId}`;
 
         if (isDev || !sentCelebrationKeys.has(sentKey)) {
-          const message = buildBirthdayMessage(employee.name, celebrantReference);
+          const message = buildBirthdayMessage(
+            employee.name,
+            celebrantReference,
+            employee.managerName
+          );
 
           try {
             await getSlackClient().chat.postMessage({
@@ -321,7 +352,8 @@ export async function sendBirthdayWishes() {
           const message = buildWorkAnniversaryMessage(
             employee.name,
             celebrantReference,
-            years
+            years,
+            employee.managerName
           );
 
           try {

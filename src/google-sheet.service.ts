@@ -121,6 +121,7 @@ function parseSheetRows(rows: string[][]) {
     "empid",
   ]);
   const nameIndex = findHeaderIndex(normalizedHeaders, ["fullname", "name"]);
+  const managerNameIndex = findHeaderIndex(normalizedHeaders, ["managername"]);
   const emailIndex = findHeaderIndex(normalizedHeaders, ["email", "workemail"]);
   const birthdayIndex = findHeaderIndex(normalizedHeaders, ["birthday", "dob"]);
   const joiningDateIndex = findHeaderIndex(normalizedHeaders, [
@@ -167,6 +168,8 @@ function parseSheetRows(rows: string[][]) {
     const employeeId =
       employeeIdIndex >= 0 ? row[employeeIdIndex] || `row-${rowNumber}` : `row-${rowNumber}`;
     const name = row[nameIndex] || "";
+    const managerName =
+      managerNameIndex >= 0 ? row[managerNameIndex] || undefined : undefined;
     const rawEmail = row[emailIndex] || "";
     const email = rawEmail.toLowerCase();
     const rawBirthday = row[birthdayIndex] || "";
@@ -230,6 +233,7 @@ function parseSheetRows(rows: string[][]) {
     employees.push({
       employeeId,
       name,
+      ...(managerName ? { managerName } : {}),
       email,
       birthday,
       joiningDate,
